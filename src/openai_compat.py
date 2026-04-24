@@ -5,11 +5,217 @@ import re
 from typing import Any, Iterator
 from urllib import error, request
 
-_THINK_RE = re.compile(r'<think>.*?</think>', re.DOTALL)
+_THINK_RE = re.compile(r'<(?:ant)?[Tt]hink(?:ing)?>.*?</(?:ant)?[Tt]hink(?:ing)?>', re.DOTALL)
+_TEXT_XML_TAG_RE = re.compile(r'<([a-zA-Z_]\w*)>(.*?)</\1>', re.DOTALL)
+# Qwen3 <tool_call>{"name": "...", "arguments": {...}}</tool_call> format
+_TOOL_CALL_TAG_RE = re.compile(r'<tool_call>(.*?)</tool_call>', re.DOTALL)
+# <tool_code>tool_name\nkey: value\n</tool_code> (Gemini-style fallback from some Qwen3 configs)
+_TOOL_CODE_TAG_RE = re.compile(r'<tool_code>\s*([a-zA-Z_]\w*)\s*(.*?)</tool_code>', re.DOTALL)
+# Qwen3 native tool call format that leaks through Ollama as special-token text:
+# tool_name<｜fe_NNN>param_name<｜fe_NNN><｜fe_NNN>value<｜fe_NNN>...
+_SPECIAL_TOKEN_TOOL_RE = re.compile(
+    r'^([a-zA-Z_]\w*)<[|｜]fe_\d+>(\w+)<[|｜]fe_\d+><[|｜]fe_\d+>([^<|｜]+?)<[|｜]',
+    re.DOTALL,
+)
+# <tool_name<argkey>param<argkey>value format (Qwen3 via some Ollama versions)
+_ARGKEY_RE = re.compile(r'^<([a-zA-Z_]\w*)<argkey>(.*)', re.DOTALL)
+# Claude-style: tool_name<invoke>\n<parameter name="key">val</parameter>\n</invoke>
+_CLAUDE_INVOKE_RE = re.compile(
+    r'\b([a-zA-Z_]\w*)\s*<invoke>(.*?)</invoke>', re.DOTALL
+)
+_CLAUDE_PARAM_RE = re.compile(r'<parameter\s+name=["\'](\w+)["\']>(.*?)</parameter>', re.DOTALL)
+# YAML-like: tool_name\n[blank lines]\nkey: value\nkey2: value2
+_YAML_TOOL_RE = re.compile(r'^([a-zA-Z_]\w*)\n+(\w+):\s*(.+)', re.DOTALL)
+# bash: <cmd> anywhere on a line (not just at start of content)
+_BASH_LINE_RE = re.compile(r'(?:^|\n)\s*bash:\s*(.+?)(?:\n|$)', re.IGNORECASE)
+# Space-separated key=value: tool_name key=value (e.g. "bash command=nyc npm test")
+_KV_SPACE_TOOL_RE = re.compile(r'^([a-zA-Z_]\w*)\s+(\w+)=(.+)$', re.DOTALL)
+# bash shorthand: "bash <cmd>" with no key= prefix (e.g. "bash pwd")
+_BASH_SHORTHAND_RE = re.compile(r'^bash\s+(?!\w+=)(.+)$', re.IGNORECASE | re.DOTALL)
+# Markdown bash/sh code block: ```bash\ncommand\n```
+_MARKDOWN_BASH_RE = re.compile(r'```(?:bash|sh|shell)\s*\n(.*?)(?:\n```|$)', re.DOTALL | re.IGNORECASE)
+# Python-style function call: tool_name(key="value", ...)
+_PYFUNC_RE = re.compile(r'\b([a-zA-Z_]\w*)\s*\(([^)]*)\)', re.DOTALL)
+_PYFUNC_KV_RE = re.compile(r'(\w+)\s*=\s*(?:"([^"]*?)"|\'([^\']*?)\'|(\S+))')
 
 
 def _strip_thinking(text: str) -> str:
     return _THINK_RE.sub('', text).lstrip()
+
+
+def _parse_pyfunc_args(args_str: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for m in _PYFUNC_KV_RE.finditer(args_str):
+        val = m.group(2) if m.group(2) is not None else (m.group(3) if m.group(3) is not None else m.group(4) or '')
+        params[m.group(1)] = val
+    if not params and args_str.strip():
+        params = {'command': args_str.strip().strip('"\'').strip()}
+    return params
+
+
+def _extract_text_format_tool_calls(
+    content: str,
+    known_tool_names: set[str],
+) -> list[Any]:  # list[ToolCall] — forward ref avoids circular import
+    """Parse tool calls emitted as text by models that don't use the OpenAI tool call API."""
+    if not content or not known_tool_names:
+        return []
+    stripped = content.strip()
+
+    # 1. Qwen3 <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    tc_m = _TOOL_CALL_TAG_RE.search(stripped)
+    if tc_m:
+        try:
+            obj = json.loads(tc_m.group(1).strip())
+            if isinstance(obj, dict):
+                name = str(obj.get('name') or '')
+                if name in known_tool_names:
+                    args = obj.get('arguments') or {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            args = {'command': args}
+                    return [{'_text_tool': True, 'name': name, 'arguments': args}]
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    # 2. XML: search for any known tool name as an XML tag (handles nesting like <function_calls>)
+    name_alt = '|'.join(re.escape(n) for n in sorted(known_tool_names, key=len, reverse=True))
+    tool_xml_re = re.compile(rf'<({name_alt})>(.*?)</\1>', re.DOTALL)
+    xml_m = tool_xml_re.search(stripped)
+    if xml_m:
+        name = xml_m.group(1)
+        body = xml_m.group(2)
+        params: dict[str, str] = {}
+        for pm in _TEXT_XML_TAG_RE.finditer(body):
+            params[pm.group(1)] = pm.group(2).strip()
+        if not params and body.strip():
+            params = {'command': body.strip()}
+        return [{'_text_tool': True, 'name': name, 'arguments': params}]
+
+    # 3. JSON action format: {"action": "tool_name", "key": "val"}
+    json_start = stripped.find('{')
+    if json_start != -1:
+        try:
+            obj = json.loads(stripped[json_start:])
+            if isinstance(obj, dict):
+                name = str(obj.get('action') or obj.get('tool') or obj.get('name') or '')
+                if name in known_tool_names:
+                    args = {k: v for k, v in obj.items() if k not in ('action', 'tool', 'name')}
+                    return [{'_text_tool': True, 'name': name, 'arguments': args}]
+        except json.JSONDecodeError:
+            pass
+
+    # 4. bash: <command> on any line
+    bash_m = _BASH_LINE_RE.search(stripped)
+    if bash_m and 'bash' in known_tool_names:
+        cmd = bash_m.group(1).strip()
+        if cmd:
+            return [{'_text_tool': True, 'name': 'bash', 'arguments': {'command': cmd}}]
+
+    # 4b. Markdown bash code block: ```bash\ncommand\n```
+    md_m = _MARKDOWN_BASH_RE.search(stripped)
+    if md_m and 'bash' in known_tool_names:
+        cmd = md_m.group(1).strip()
+        if cmd:
+            return [{'_text_tool': True, 'name': 'bash', 'arguments': {'command': cmd}}]
+
+    # 4c. Space-separated key=value: "bash command=nyc npm test" or "tool_name key=value"
+    kv_m = _KV_SPACE_TOOL_RE.match(stripped)
+    if kv_m:
+        name = kv_m.group(1)
+        if name in known_tool_names:
+            key, value = kv_m.group(2), kv_m.group(3).strip()
+            return [{'_text_tool': True, 'name': name, 'arguments': {key: value}}]
+
+    # 4d. bash shorthand: "bash <cmd>" with no key= prefix (e.g. "bash pwd")
+    bs_m = _BASH_SHORTHAND_RE.match(stripped)
+    if bs_m and 'bash' in known_tool_names:
+        cmd = bs_m.group(1).strip()
+        if cmd:
+            return [{'_text_tool': True, 'name': 'bash', 'arguments': {'command': cmd}}]
+
+    # 5. Python-style function call: tool_name(key="value", ...)
+    for m in _PYFUNC_RE.finditer(stripped):
+        name = m.group(1)
+        if name in known_tool_names:
+            args_str = m.group(2).strip()
+            return [{'_text_tool': True, 'name': name, 'arguments': _parse_pyfunc_args(args_str)}]
+
+    # 6. <tool_code>tool_name\nkey: value\n</tool_code> (Gemini-style)
+    tc_code_m = _TOOL_CODE_TAG_RE.search(stripped)
+    if tc_code_m:
+        name = tc_code_m.group(1)
+        if name in known_tool_names:
+            body = tc_code_m.group(2).strip()
+            params: dict[str, str] = {}
+            for line in body.splitlines():
+                if ':' in line:
+                    k, _, v = line.partition(':')
+                    params[k.strip()] = v.strip()
+            if not params and body:
+                params = {'command': body}
+            return [{'_text_tool': True, 'name': name, 'arguments': params}]
+
+    # 7. <tool_name<argkey>param<argkey>value (Qwen3 via certain Ollama versions)
+    ak_m = _ARGKEY_RE.match(stripped)
+    if ak_m:
+        name = ak_m.group(1)
+        if name in known_tool_names:
+            parts = ak_m.group(2).split('<argkey>')
+            args: dict[str, str] = {}
+            for i in range(0, len(parts) - 1, 2):
+                key = parts[i].strip()
+                val = parts[i + 1].strip() if i + 1 < len(parts) else ''
+                if key:
+                    args[key] = val
+            return [{'_text_tool': True, 'name': name, 'arguments': args}]
+
+    # 8. Claude-style: tool_name<invoke><parameter name="key">val</parameter></invoke>
+    ci_m = _CLAUDE_INVOKE_RE.search(stripped)
+    if ci_m:
+        name = ci_m.group(1)
+        if name in known_tool_names:
+            body = ci_m.group(2)
+            params = {m.group(1): m.group(2).strip() for m in _CLAUDE_PARAM_RE.finditer(body)}
+            return [{'_text_tool': True, 'name': name, 'arguments': params}]
+
+    # 9. YAML-like: tool_name\nkey: value
+    yl_m = _YAML_TOOL_RE.match(stripped)
+    if yl_m:
+        name = yl_m.group(1)
+        if name in known_tool_names:
+            params = {}
+            for line in stripped.splitlines()[1:]:
+                if ':' in line:
+                    k, _, v = line.partition(':')
+                    params[k.strip()] = v.strip()
+            if params:
+                return [{'_text_tool': True, 'name': name, 'arguments': params}]
+
+    # 9b. tool_name\n{JSON args} — model writes the tool name on one line then a JSON object
+    if '\n' in stripped:
+        first_line, _, rest = stripped.partition('\n')
+        first_line = first_line.strip()
+        if first_line in known_tool_names:
+            rest = rest.strip()
+            if rest.startswith('{'):
+                try:
+                    args = json.loads(rest)
+                    if isinstance(args, dict):
+                        return [{'_text_tool': True, 'name': first_line, 'arguments': args}]
+                except json.JSONDecodeError:
+                    pass
+
+    # 10. Qwen3 native special-token format leaked as text
+    st = _SPECIAL_TOKEN_TOOL_RE.match(stripped)
+    if st:
+        name, param, value = st.group(1), st.group(2), st.group(3).strip()
+        if name in known_tool_names:
+            return [{'_text_tool': True, 'name': name, 'arguments': {param: value}}]
+
+    return []
 
 from .agent_types import (
     AssistantTurn,
@@ -173,6 +379,26 @@ class OpenAICompatClient:
         content = _strip_thinking(_normalize_content(message.get('content')))
         tool_calls = self._parse_tool_calls_from_message(message)
 
+        # Fallback: parse text-format tool calls for models (e.g. qwen3.6 via Ollama) that
+        # emit XML/JSON/prefix tool calls as content instead of API-level tool_calls.
+        if not tool_calls and content and tools:
+            known_names = {
+                t.get('function', {}).get('name', '')
+                for t in tools
+                if isinstance(t, dict)
+            } - {''}
+            text_calls = _extract_text_format_tool_calls(content, known_names)
+            if text_calls:
+                tool_calls = [
+                    ToolCall(
+                        id=f'text_call_{i}',
+                        name=tc['name'],
+                        arguments=tc['arguments'],
+                    )
+                    for i, tc in enumerate(text_calls)
+                ]
+                content = ''  # consumed by tool calls
+
         finish_reason = first_choice.get('finish_reason')
         if finish_reason is not None and not isinstance(finish_reason, str):
             finish_reason = str(finish_reason)
@@ -275,6 +501,17 @@ class OpenAICompatClient:
         response_format = _build_response_format(output_schema)
         if response_format is not None:
             payload['response_format'] = response_format
+        # Qwen3 models default to thinking mode. For non-streaming requests (e.g. review)
+        # the full response must buffer before any bytes arrive, so thinking causes
+        # timeouts — suppress it. For streaming requests thinking tokens arrive
+        # incrementally (no timeout) and are required for proper function-call emission
+        # on qwen3.6: sending think:false causes the model to output Gemini-style
+        # <tool_code> text blocks instead of OpenAI API-level tool calls.
+        model_lower = self.config.model.lower()
+        if 'qwen3' in model_lower and 'qwen2.5' not in model_lower and not stream:
+            payload['think'] = False
+        if self.config.num_ctx > 0:
+            payload.setdefault('options', {})['num_ctx'] = self.config.num_ctx
         return payload
 
     def _parse_tool_calls_from_message(self, message: dict[str, Any]) -> list[ToolCall]:
