@@ -99,6 +99,7 @@ class ModelConfig:
     temperature: float = 0.0
     timeout_seconds: float = 120.0
     pricing: ModelPricing = field(default_factory=ModelPricing)
+    num_ctx: int = 0  # Ollama context window; 0 = use server default
 
 
 @dataclass(frozen=True)

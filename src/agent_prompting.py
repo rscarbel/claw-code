@@ -125,8 +125,7 @@ def render_system_prompt(parts: list[str]) -> str:
 
 def get_intro_section() -> str:
     return (
-        'You are Claw Code Python, a Python reimplementation of a Claude Code-style '
-        'coding agent. You are an interactive software-engineering assistant. Use '
+        'You are Claw Code, a coding agent. You are an interactive software-engineering assistant. Use '
         'the instructions below and the tools available to help the user complete '
         'software engineering tasks.'
     )

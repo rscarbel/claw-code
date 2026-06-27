@@ -258,6 +258,24 @@ class AgentSessionState:
             metadata=merged_metadata,
         )
 
+    def patch_assistant_as_tool_calls(
+        self,
+        index: int,
+        raw_tool_calls: tuple[JSONDict, ...],
+    ) -> None:
+        """Replace accumulated text content with structured tool calls.
+
+        Used by the streaming text-format fallback when the model emits tool
+        calls as text (e.g. <bash>cmd</bash>) instead of via the API.
+        """
+        message = self.messages[index]
+        self.messages[index] = replace(
+            message,
+            content='',
+            tool_calls=raw_tool_calls,
+            blocks=_assistant_blocks('', raw_tool_calls),
+        )
+
     def finalize_assistant(
         self,
         index: int,

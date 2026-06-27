@@ -900,7 +900,84 @@ def build_parser() -> argparse.ArgumentParser:
     agents_parser.add_argument('agent_type', nargs='?')
     agents_parser.add_argument('--all', action='store_true')
     _add_agent_common_args(agents_parser, include_backend=False)
+
+    local_llm_parser = subparsers.add_parser(
+        'agent-local-llm',
+        help='run the multi-model local LLM agent (routing + planning + coding models)',
+    )
+    local_llm_parser.add_argument('prompt')
+    local_llm_parser.add_argument('--cwd', default='.')
+    local_llm_parser.add_argument('--coding-model')
+    local_llm_parser.add_argument('--coding-model-base-url')
+    local_llm_parser.add_argument('--coding-model-api-key')
+    local_llm_parser.add_argument('--planning-model')
+    local_llm_parser.add_argument('--planning-model-base-url')
+    local_llm_parser.add_argument('--planning-model-api-key')
+    local_llm_parser.add_argument('--selection-model')
+    local_llm_parser.add_argument('--selection-model-base-url')
+    local_llm_parser.add_argument('--selection-model-api-key')
+    local_llm_parser.add_argument('--review-model')
+    local_llm_parser.add_argument('--review-model-base-url')
+    local_llm_parser.add_argument('--review-model-api-key')
+    local_llm_parser.add_argument('--diagnosis-model')
+    local_llm_parser.add_argument('--diagnosis-model-base-url')
+    local_llm_parser.add_argument('--diagnosis-model-api-key')
+    local_llm_parser.add_argument('--max-tasks-per-session', type=int)
+    local_llm_parser.add_argument('--max-review-loops', type=int)
+    local_llm_parser.add_argument('--resume-session-id', help='Resume an existing session by ID')
+
     return parser
+
+
+def _run_local_llm_agent(args: argparse.Namespace) -> int:
+    import sys
+    import uuid
+    from dataclasses import replace as _replace
+
+    from .local_llm.config import load_local_llm_config
+    from .local_llm.executor import TaskExecutor
+
+    cwd = Path(args.cwd).resolve()
+    config = load_local_llm_config(cwd)
+
+    _model_overrides = [
+        ('coding_model', 'model', args.coding_model),
+        ('coding_model', 'base_url', args.coding_model_base_url),
+        ('coding_model', 'api_key', args.coding_model_api_key),
+        ('planning_model', 'model', args.planning_model),
+        ('planning_model', 'base_url', args.planning_model_base_url),
+        ('planning_model', 'api_key', args.planning_model_api_key),
+        ('selection_model', 'model', args.selection_model),
+        ('selection_model', 'base_url', args.selection_model_base_url),
+        ('selection_model', 'api_key', args.selection_model_api_key),
+        ('review_model', 'model', args.review_model),
+        ('review_model', 'base_url', args.review_model_base_url),
+        ('review_model', 'api_key', args.review_model_api_key),
+        ('diagnosis_model', 'model', args.diagnosis_model),
+        ('diagnosis_model', 'base_url', args.diagnosis_model_base_url),
+        ('diagnosis_model', 'api_key', args.diagnosis_model_api_key),
+    ]
+    for config_attr, model_field, value in _model_overrides:
+        if value:
+            config = _replace(config, **{config_attr: _replace(getattr(config, config_attr), **{model_field: value})})
+    if args.max_tasks_per_session is not None:
+        config = _replace(config, max_tasks_per_session=args.max_tasks_per_session)
+    if args.max_review_loops is not None:
+        config = _replace(config, max_review_loops=args.max_review_loops)
+
+    resume_session_id = getattr(args, 'resume_session_id', None)
+    if resume_session_id:
+        session_id = resume_session_id
+        resume = True
+    else:
+        session_id = uuid.uuid4().hex
+        resume = False
+
+    executor = TaskExecutor(config, cwd)
+    output = executor.run(args.prompt, session_id, resume=resume)
+    print(output)
+    print(f'session_id={session_id}', file=sys.stderr)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1540,6 +1617,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(agent.render_agents_report(show_all=bool(args.all)))
         return 0
+
+    if args.command == 'agent-local-llm':
+        return _run_local_llm_agent(args)
 
     parser.error(f'unknown command: {args.command}')
     return 2

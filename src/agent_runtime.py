@@ -51,7 +51,12 @@ from .agent_types import (
     ToolExecutionResult,
     UsageStats,
 )
-from .openai_compat import OpenAICompatClient, OpenAICompatError
+from .openai_compat import (
+    OpenAICompatClient,
+    OpenAICompatError,
+    _extract_text_format_tool_calls,
+    _strip_thinking,
+)
 from .plan_runtime import PlanRuntime
 from .plugin_runtime import PluginRuntime
 from .remote_runtime import RemoteRuntime
@@ -1211,6 +1216,39 @@ class LocalCodingAgent:
             raw_message=assistant_message.to_openai_message(),
             usage=usage,
         )
+        # Streaming text-format fallback: replicate the detection that
+        # OpenAICompatClient.complete() already applies for non-streaming.
+        # When qwen3/other models emit tool calls as text instead of API
+        # tool_call deltas, parse them here so execution can proceed.
+        if not turn.tool_calls and turn.content and tool_specs:
+            known_names = {
+                t.get('function', {}).get('name', '')
+                for t in tool_specs
+                if isinstance(t, dict)
+            } - {''}
+            text_calls = _extract_text_format_tool_calls(
+                _strip_thinking(turn.content), known_names
+            )
+            if text_calls:
+                raw_tool_calls = tuple(
+                    {
+                        'id': f'text_call_{i}',
+                        'type': 'function',
+                        'function': {
+                            'name': tc['name'],
+                            'arguments': json.dumps(tc['arguments'], ensure_ascii=True),
+                        },
+                    }
+                    for i, tc in enumerate(text_calls)
+                )
+                session.patch_assistant_as_tool_calls(assistant_index, raw_tool_calls)
+                turn = AssistantTurn(
+                    content='',
+                    tool_calls=self._tool_calls_from_message(raw_tool_calls),
+                    finish_reason=turn.finish_reason,
+                    raw_message=session.messages[assistant_index].to_openai_message(),
+                    usage=turn.usage,
+                )
         return turn, tuple(events)
 
     def _tool_calls_from_message(
