@@ -14,7 +14,6 @@ archive/
 .clawd-agents/
 
 # Local agent/runtime artifacts
-.claude/
 .claude.json
 .port_sessions/
 
